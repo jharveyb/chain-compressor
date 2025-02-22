@@ -1,3 +1,7 @@
+use std::fs;
+use std::ops::Range;
+use std::path::PathBuf;
+
 use async_compression::tokio::write::ZstdEncoder;
 use bitcoin::Block;
 use bitcoin::consensus;
@@ -6,6 +10,9 @@ use bitcoincore_rpc::{Client, RpcApi, bitcoin};
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
+use tokio::select;
+use tokio::task;
+use tokio_util::sync::CancellationToken;
 
 // blocks are average size 900 kB; 727791885830 bytes / 884760 blocks
 pub const AVG_BLOCK_SIZE: usize = 900_000;
@@ -42,4 +49,111 @@ pub async fn zstd_block(block: &Block, height: u64) -> anyhow::Result<(ZstdBlock
         cmp_size: zstd_buf.len() as u64,
     };
     Ok((stats_line, block_buf))
+}
+
+pub async fn fetch_block(
+    token: CancellationToken,
+    rpc: Client,
+    height: flume::Receiver<u64>,
+    blocks: flume::Sender<(u64, Block)>,
+) -> anyhow::Result<()> {
+    while let Some(new_height) = select! {
+        _ = token.cancelled() => None,
+        new_height = height.recv_async() => Some(new_height?),
+    } {
+        // our RPC call is blocking
+        let block = task::block_in_place(|| get_block(&rpc, new_height))?;
+        println!("fetched block {}", new_height);
+        blocks.send_async((new_height, block)).await?;
+    }
+    Ok(())
+}
+
+pub async fn process_block_zstd(
+    token: CancellationToken,
+    blocks_in: flume::Receiver<(u64, Block)>,
+    stats: flume::Sender<ZstdBlockStats>,
+    blocks_out: flume::Sender<(u64, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    while let Some(block_with_height) = select! {
+        _ = token.cancelled() => None,
+        block_with_height = blocks_in.recv_async() => Some(block_with_height?),
+    } {
+        let (height, block) = block_with_height;
+        let (block_stats, raw_block) = zstd_block(&block, height).await?;
+        println!("compressed block {}", height);
+        stats.send_async(block_stats).await?;
+        blocks_out.send_async((height, raw_block)).await?;
+    }
+    Ok(())
+}
+
+pub async fn write_raw_block(
+    token: CancellationToken,
+    blocks_in: flume::Receiver<(u64, Vec<u8>)>,
+    job_out: flume::Sender<()>,
+    dir: PathBuf,
+) -> anyhow::Result<()> {
+    while let Some(block_with_height) = select! {
+        _ = token.cancelled() => None,
+        block_with_height = blocks_in.recv_async() => Some(block_with_height?),
+    } {
+        let (height, block) = block_with_height;
+        let filename = format!("{}.blk", height);
+        let filepath = dir.join(filename);
+        tokio::fs::write(filepath, &block).await?;
+        println!("wrote block {}", height);
+        job_out.send_async(()).await?;
+    }
+    Ok(())
+}
+
+pub async fn write_csv(
+    token: CancellationToken,
+    mut statwriter: csv::Writer<fs::File>,
+    stats_in: flume::Receiver<ZstdBlockStats>,
+    job_out: flume::Sender<()>,
+) -> anyhow::Result<()> {
+    while let Some(stats) = select! {
+        _ = token.cancelled() => None,
+        stats = stats_in.recv_async() => Some(stats?),
+    } {
+        statwriter.serialize(stats)?;
+        println!("wrote stats");
+        job_out.send_async(()).await?;
+    }
+    Ok(())
+}
+
+pub async fn send_heights(
+    token: CancellationToken,
+    heights: Range<u64>,
+    height_tx: flume::Sender<u64>,
+) -> anyhow::Result<()> {
+    for height in heights {
+        select! {
+            _ = token.cancelled() => break,
+        _ = height_tx.send_async(height) => {
+        println!("sent height {}", height);
+        },
+        }
+    }
+    Ok(())
+}
+
+pub async fn count_msgs(
+    token: CancellationToken,
+    msgs: flume::Receiver<()>,
+    target: u64,
+) -> anyhow::Result<u64> {
+    let mut count = 0;
+    while count < target {
+        select! {
+            _ = token.cancelled() => break,
+            _ = msgs.recv_async() => {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
