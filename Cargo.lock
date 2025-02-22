@@ -255,10 +255,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-compression",
+ "bitcoin",
  "bitcoincore-rpc",
  "clap",
  "csv",
  "hex",
+ "serde",
  "tokio",
 ]
 

@@ -1,5 +1,7 @@
+use std::fs::{self, File};
 use std::path::PathBuf;
 
+use bitcoin::Block;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chain_compressor::*;
 use clap::{Parser, Subcommand};
@@ -34,10 +36,10 @@ enum Commands {
         pass: String,
 
         #[arg(long)]
-        write: Option<bool>,
+        blockdir: Option<PathBuf>,
 
         #[arg(long)]
-        outdir: Option<PathBuf>,
+        statdir: Option<PathBuf>,
 
         #[arg(long)]
         start_height: u64,
@@ -68,8 +70,8 @@ async fn main() -> anyhow::Result<()> {
             url,
             user,
             pass,
-            write,
-            outdir,
+            blockdir,
+            statdir,
             start_height,
             count,
         } => {
@@ -77,12 +79,52 @@ async fn main() -> anyhow::Result<()> {
             let chaininfo = rpc.get_blockchain_info()?;
             let chain_tip_height = chaininfo.blocks;
 
-            let tip_block = get_block(&rpc, chain_tip_height)?;
-            let block_stats = zstd_block(tip_block, chain_tip_height).await?;
-            println!(
-                "height: {}, orig. size: {}, cmp. size: {}",
-                block_stats.0, block_stats.1, block_stats.2
-            );
+            let block_nums = match count {
+                Some(block_range) => *start_height..(start_height + block_range),
+                None => 0_u64..chain_tip_height,
+            };
+
+            if let Some(blockdir) = blockdir {
+                match fs::exists(blockdir) {
+                    Ok(true) => {}
+                    _ => fs::create_dir_all(blockdir)?,
+                }
+            }
+
+            let zstd_stats_filename = "zstd_cmp_stats.csv";
+            let mut zstdstatwriter = if let Some(statdir) = statdir {
+                if !fs::exists(statdir)? {
+                    fs::create_dir_all(statdir)?;
+                }
+
+                let zstdstatfile = statdir.join(zstd_stats_filename);
+                if !fs::exists(&zstdstatfile)? {
+                    let _ = File::create(&zstdstatfile)?;
+                    // close file immediately
+                }
+
+                let stats_file = File::options().append(true).open(&zstdstatfile)?;
+                Some(csv::Writer::from_writer(stats_file))
+            } else {
+                None
+            };
+
+            let mut block_buf: Block;
+            for height in block_nums {
+                block_buf = get_block(&rpc, height)?;
+                let (block_stats, block_bytes) = zstd_block(block_buf, height).await?;
+                println!("{:?}", block_stats);
+
+                if let Some(blockdir) = blockdir {
+                    let filename = format!("{}.blk", height);
+                    let filepath = blockdir.join(filename);
+                    fs::write(filepath, &block_bytes)?;
+                }
+
+                if let Some(zstdstatwriter) = zstdstatwriter.as_mut() {
+                    zstdstatwriter.serialize(block_stats)?;
+                }
+            }
 
             Ok(())
         }
