@@ -25,7 +25,7 @@ pub fn get_block(rpc: &Client, height: u64) -> anyhow::Result<Block> {
 }
 
 // encode a block, compress with zstd, and report the compressed size
-pub async fn zstd_block(block: Block, height: u64) -> anyhow::Result<(ZstdBlockStats, Vec<u8>)> {
+pub async fn zstd_block(block: &Block, height: u64) -> anyhow::Result<(ZstdBlockStats, Vec<u8>)> {
     let mut block_buf = Vec::with_capacity(AVG_BLOCK_SIZE);
     block.consensus_encode(&mut block_buf)?;
     let block_size = block_buf.len();

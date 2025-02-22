@@ -79,28 +79,30 @@ async fn main() -> anyhow::Result<()> {
             let chaininfo = rpc.get_blockchain_info()?;
             let chain_tip_height = chaininfo.blocks;
 
+            // set our block height range
             let block_nums = match count {
                 Some(block_range) => *start_height..(start_height + block_range),
                 None => 0_u64..chain_tip_height,
             };
 
             if let Some(blockdir) = blockdir {
-                match fs::exists(blockdir) {
-                    Ok(true) => {}
-                    _ => fs::create_dir_all(blockdir)?,
+                if !fs::exists(blockdir)? {
+                    fs::create_dir_all(blockdir)?;
                 }
             }
 
+            // create our CSV reader for exporting stats
             let zstd_stats_filename = "zstd_cmp_stats.csv";
             let mut zstdstatwriter = if let Some(statdir) = statdir {
                 if !fs::exists(statdir)? {
                     fs::create_dir_all(statdir)?;
                 }
 
+                // create stats file before appending; we shouldn't end up
+                // truncating existing contents
                 let zstdstatfile = statdir.join(zstd_stats_filename);
                 if !fs::exists(&zstdstatfile)? {
                     let _ = File::create(&zstdstatfile)?;
-                    // close file immediately
                 }
 
                 let stats_file = File::options().append(true).open(&zstdstatfile)?;
@@ -112,9 +114,10 @@ async fn main() -> anyhow::Result<()> {
             let mut block_buf: Block;
             for height in block_nums {
                 block_buf = get_block(&rpc, height)?;
-                let (block_stats, block_bytes) = zstd_block(block_buf, height).await?;
+                let (block_stats, block_bytes) = zstd_block(&block_buf, height).await?;
                 println!("{:?}", block_stats);
 
+                // write outputs
                 if let Some(blockdir) = blockdir {
                     let filename = format!("{}.blk", height);
                     let filepath = blockdir.join(filename);
