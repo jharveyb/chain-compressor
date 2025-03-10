@@ -121,11 +121,11 @@ async fn main() -> anyhow::Result<()> {
             // set our block height range
             let block_nums = match count {
                 Some(block_range) => start_height..(start_height + block_range),
-                None => 0_u64..chain_tip_height,
+                None => start_height..chain_tip_height,
             };
             let target_job_count = match count {
                 Some(block_range) => block_range,
-                None => chain_tip_height,
+                None => chain_tip_height - start_height,
             };
 
             // set jobs to detect pipeline completion
