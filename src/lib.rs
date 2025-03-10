@@ -22,6 +22,8 @@ pub struct ZstdBlockStats {
     height: u64,
     orig_size: u64,
     cmp_size: u64,
+    ratio: f32,
+    savings: f32,
 }
 
 // lookup block by height, return decoded block and its consensus size
@@ -42,11 +44,16 @@ pub async fn zstd_block(block: &Block, height: u64) -> anyhow::Result<(ZstdBlock
     let mut cmp = ZstdEncoder::with_quality(&mut zstd_buf, async_compression::Level::Default);
     cmp.write_all(&block_buf).await?;
     cmp.flush().await?;
+    let cmp_size = zstd_buf.len() as u64;
+    let ratio = block_size as f32 / cmp_size as f32;
+    let savings = 1_f32 - (cmp_size as f32 / block_size as f32);
 
     let stats_line = ZstdBlockStats {
         height,
         orig_size: block_size as u64,
         cmp_size: zstd_buf.len() as u64,
+        ratio,
+        savings,
     };
     Ok((stats_line, block_buf))
 }
