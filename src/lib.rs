@@ -70,7 +70,9 @@ pub async fn fetch_block(
     } {
         // our RPC call is blocking
         let block = task::block_in_place(|| get_block(&rpc, new_height))?;
-        println!("fetched block {}", new_height);
+        if new_height % 100 == 0 {
+            println!("fetched block {}", new_height);
+        }
         blocks.send_async((new_height, block)).await?;
     }
     Ok(())
@@ -109,7 +111,9 @@ pub async fn write_raw_block(
         let filename = format!("{}.blk", height);
         let filepath = dir.join(filename);
         tokio::fs::write(filepath, &block).await?;
-        println!("wrote block {}", height);
+        if height % 100 == 0 {
+            println!("wrote block {}", height);
+        }
         job_out.send_async(()).await?;
     }
     Ok(())
@@ -126,7 +130,6 @@ pub async fn write_csv(
         stats = stats_in.recv_async() => Some(stats?),
     } {
         statwriter.serialize(stats)?;
-        println!("wrote stats");
         job_out.send_async(()).await?;
     }
     Ok(())
@@ -141,7 +144,9 @@ pub async fn send_heights(
         select! {
             _ = token.cancelled() => break,
         _ = height_tx.send_async(height) => {
-        println!("sent height {}", height);
+            if height % 100 == 0 {
+                println!("sent height {}", height);
+            }
         },
         }
     }
@@ -151,6 +156,7 @@ pub async fn send_heights(
 pub async fn count_msgs(
     token: CancellationToken,
     msgs: flume::Receiver<()>,
+    title: String,
     target: u64,
 ) -> anyhow::Result<u64> {
     let mut count = 0;
@@ -159,6 +165,9 @@ pub async fn count_msgs(
             _ = token.cancelled() => break,
             _ = msgs.recv_async() => {
                 count += 1;
+                if count % 100 == 0 {
+                    println!("{title}: received {count} messages");
+                }
             }
         }
     }
