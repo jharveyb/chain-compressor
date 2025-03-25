@@ -109,7 +109,6 @@ async fn main() -> anyhow::Result<()> {
             let mut write_blocks_set = JoinSet::new();
             let mut write_stats_set = JoinSet::new();
             let mut height_send_set = JoinSet::new();
-            let mut completion_set = JoinSet::new();
 
             let rpc_thread_num = rpc_threads.unwrap_or(1);
             let io_thread_num = io_threads.unwrap_or(1);
@@ -130,16 +129,11 @@ async fn main() -> anyhow::Result<()> {
             };
 
             // set jobs to detect pipeline completion
-            completion_set.spawn(count_msgs(
-                cancel_signal.child_token(),
-                raw_block_job_rx,
-                target_job_count,
-            ));
-            completion_set.spawn(count_msgs(
-                cancel_signal.child_token(),
-                stat_job_rx,
-                target_job_count,
-            ));
+            let count_chans = vec![
+                ("block write".to_string(), raw_block_job_rx),
+                ("stat write".to_string(), stat_job_rx),
+            ];
+            let completion_set = pipeline_checks(count_chans, &cancel_signal, target_job_count);
 
             // populate task pools
             for _ in 0..rpc_thread_num {

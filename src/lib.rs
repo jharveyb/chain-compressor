@@ -12,6 +12,7 @@ use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::select;
 use tokio::task;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 // blocks are average size 900 kB; 727791885830 bytes / 884760 blocks
@@ -172,4 +173,21 @@ pub async fn count_msgs(
         }
     }
     Ok(count)
+}
+
+pub fn pipeline_checks(
+    ack_chans: Vec<(String, flume::Receiver<()>)>,
+    cancel_handle: &CancellationToken,
+    target: u64,
+) -> JoinSet<Result<u64, anyhow::Error>> {
+    let mut completion_set = JoinSet::new();
+    for (title, ack_chan) in ack_chans.into_iter() {
+        completion_set.spawn(count_msgs(
+            cancel_handle.child_token(),
+            ack_chan,
+            title,
+            target,
+        ));
+    }
+    completion_set
 }
