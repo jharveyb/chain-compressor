@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chain_compressor::*;
 use clap::{Args, Parser, Subcommand};
+use csv::WriterBuilder;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -176,12 +177,20 @@ async fn main() -> anyhow::Result<()> {
                 // create stats file before appending; we shouldn't end up
                 // truncating existing contents
                 let zstdstatfile = statdir.join(zstd_stats_filename);
-                if !fs::exists(&zstdstatfile)? {
+                let existing_file = fs::exists(&zstdstatfile)?;
+                if !existing_file {
                     let _ = File::create(&zstdstatfile)?;
                 }
 
                 let stats_file = File::options().append(true).open(&zstdstatfile)?;
-                Some(csv::Writer::from_writer(stats_file))
+                let writer = match existing_file {
+                    // don't write CSV headers again if we're appending
+                    true => WriterBuilder::new()
+                        .has_headers(false)
+                        .from_writer(stats_file),
+                    false => WriterBuilder::new().from_writer(stats_file),
+                };
+                Some(writer)
             } else {
                 None
             };
