@@ -27,6 +27,18 @@ struct RpcConn {
     pass: String,
 }
 
+#[derive(Args)]
+struct PerfParams {
+    #[arg(long)]
+    rpc_threads: Option<u16>,
+
+    #[arg(long)]
+    io_threads: Option<u16>,
+
+    #[arg(long)]
+    compute_threads: Option<u16>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     CheckConnection {
@@ -37,14 +49,8 @@ enum Commands {
         #[command(flatten)]
         rpc_conn: RpcConn,
 
-        #[arg(long)]
-        rpc_threads: Option<u16>,
-
-        #[arg(long)]
-        io_threads: Option<u16>,
-
-        #[arg(long)]
-        compute_threads: Option<u16>,
+        #[command(flatten)]
+        perf_args: PerfParams,
 
         #[arg(long)]
         blockdir: Option<PathBuf>,
@@ -86,9 +92,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::CompressZstd {
             rpc_conn,
-            rpc_threads,
-            io_threads,
-            compute_threads,
+            perf_args,
             blockdir,
             statdir,
             start_height,
@@ -110,9 +114,9 @@ async fn main() -> anyhow::Result<()> {
             let mut write_stats_set = JoinSet::new();
             let mut height_send_set = JoinSet::new();
 
-            let rpc_thread_num = rpc_threads.unwrap_or(1);
-            let io_thread_num = io_threads.unwrap_or(1);
-            let compute_thread_num = compute_threads.unwrap_or(1);
+            let rpc_thread_num = perf_args.rpc_threads.unwrap_or(1);
+            let io_thread_num = perf_args.io_threads.unwrap_or(1);
+            let compute_thread_num = perf_args.compute_threads.unwrap_or(1);
 
             let rpc = create_rpc_conn(&rpc_conn)?;
             let chaininfo = rpc.get_blockchain_info()?;
