@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
             // create task pools
             let mut fetch_block_set = JoinSet::new();
-            let mut process_block_zstd_set = JoinSet::new();
+            // let mut process_block_zstd_set = JoinSet::new();
             let mut write_blocks_set = JoinSet::new();
             let mut write_stats_set = JoinSet::new();
             let mut height_send_set = JoinSet::new();
@@ -150,6 +150,15 @@ async fn main() -> anyhow::Result<()> {
                 ));
             }
 
+            let process_block_zstd_set = process_block_workers(
+                &cancel_signal,
+                blocks_rx,
+                zstd_block,
+                stats_tx,
+                raw_blocks_tx,
+                compute_thread_num,
+            );
+            /*
             for _ in 0..compute_thread_num {
                 let _ = process_block_zstd_set.spawn(process_block_zstd(
                     cancel_signal.child_token(),
@@ -158,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
                     raw_blocks_tx.clone(),
                 ));
             }
+            */
 
             if let Some(blockdir) = blockdir.as_ref() {
                 if !fs::exists(blockdir)? {

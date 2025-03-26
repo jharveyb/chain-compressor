@@ -1,4 +1,7 @@
+use futures::Stream;
+use futures::StreamExt;
 use std::fs;
+use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -14,6 +17,45 @@ use tokio::select;
 use tokio::task;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+// trait for an async fn that accepts (block, height) and returns (stats, new_block)
+// where new_block may be a different type, like raw bytes
+pub trait BlockProcessor<S, B>
+where
+    S: Send + Sync + 'static,
+    B: Send + Sync + 'static,
+{
+    type Future: Future<Output = anyhow::Result<(S, B)>> + Send + 'static;
+
+    fn run(&self, block: Block, height: u64) -> Self::Future;
+}
+
+// Implement the trait for any function that returns a future with the
+// correct signature; which can be a simple closure
+impl<S, B, F, Fut> BlockProcessor<S, B> for F
+where
+    F: Fn(Block, u64) -> Fut + Send + Clone + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<(S, B)>> + Send + 'static,
+    S: Send + Sync + 'static,
+    B: Send + Sync + 'static,
+{
+    type Future = Fut;
+
+    fn run(&self, block: Block, height: u64) -> Self::Future {
+        self(block, height)
+    }
+}
+
+pub async fn recv_or_cancel<T>(
+    token: &CancellationToken,
+    receiver: &mut (impl Stream<Item = T> + Unpin),
+) -> Option<T> {
+    select! {
+        _ = token.cancelled() => None,
+        // propagate the None from an empty stream
+        result = receiver.next() => Some(result?),
+    }
+}
 
 // blocks are average size 900 kB; 727791885830 bytes / 884760 blocks
 pub const AVG_BLOCK_SIZE: usize = 900_000;
@@ -35,7 +77,7 @@ pub fn get_block(rpc: &Client, height: u64) -> anyhow::Result<Block> {
 }
 
 // encode a block, compress with zstd, and report the compressed size
-pub async fn zstd_block(block: &Block, height: u64) -> anyhow::Result<(ZstdBlockStats, Vec<u8>)> {
+pub async fn zstd_block(block: Block, height: u64) -> anyhow::Result<(ZstdBlockStats, Vec<u8>)> {
     let mut block_buf = Vec::with_capacity(AVG_BLOCK_SIZE);
     block.consensus_encode(&mut block_buf)?;
     let block_size = block_buf.len();
@@ -79,6 +121,57 @@ pub async fn fetch_block(
     Ok(())
 }
 
+pub async fn process_block<B, S, P>(
+    token: CancellationToken,
+    blocks_in: flume::Receiver<(u64, Block)>,
+    processor: P,
+    stats_out: flume::Sender<S>,
+    blocks_out: flume::Sender<(u64, B)>,
+) -> anyhow::Result<()>
+where
+    P: BlockProcessor<S, B>,
+    S: Send + Sync + 'static,
+    B: Send + Sync + 'static,
+{
+    // closure that creates new futures for each loop iteration
+    let process = |block, height| processor.run(block, height);
+    let mut block_stream = blocks_in.into_stream();
+    while let Some(block_with_height) = recv_or_cancel(&token, &mut block_stream).await {
+        let (height, block) = block_with_height;
+        let (block_stats, new_block) = process(block, height).await?;
+        stats_out.send_async(block_stats).await?;
+        blocks_out.send_async((height, new_block)).await?;
+    }
+    Ok(())
+}
+
+pub fn process_block_workers<B, S, P>(
+    cancel_handle: &CancellationToken,
+    blocks_in: flume::Receiver<(u64, Block)>,
+    processor: P,
+    stats_out: flume::Sender<S>,
+    blocks_out: flume::Sender<(u64, B)>,
+    worker_count: u16,
+) -> JoinSet<Result<(), anyhow::Error>>
+where
+    P: BlockProcessor<S, B> + Send + Clone + Sync + 'static,
+    S: Send + Sync + 'static,
+    B: Send + Sync + 'static,
+{
+    let mut worker_set = JoinSet::new();
+    for _ in 0..worker_count {
+        let processor = processor.clone();
+        let _ = worker_set.spawn(process_block(
+            cancel_handle.child_token(),
+            blocks_in.clone(),
+            processor,
+            stats_out.clone(),
+            blocks_out.clone(),
+        ));
+    }
+    worker_set
+}
+
 pub async fn process_block_zstd(
     token: CancellationToken,
     blocks_in: flume::Receiver<(u64, Block)>,
@@ -90,7 +183,7 @@ pub async fn process_block_zstd(
         block_with_height = blocks_in.recv_async() => Some(block_with_height?),
     } {
         let (height, block) = block_with_height;
-        let (block_stats, raw_block) = zstd_block(&block, height).await?;
+        let (block_stats, raw_block) = zstd_block(block, height).await?;
         println!("compressed block {}", height);
         stats.send_async(block_stats).await?;
         blocks_out.send_async((height, raw_block)).await?;
