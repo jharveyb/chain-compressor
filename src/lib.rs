@@ -18,6 +18,8 @@ use tokio::task;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+mod util;
+
 // trait for an async fn that accepts (block, height) and returns (stats, new_block)
 // where new_block may be a different type, like raw bytes
 pub trait BlockProcessor<S, B>
@@ -43,17 +45,6 @@ where
 
     fn run(&self, block: Block, height: u64) -> Self::Future {
         self(block, height)
-    }
-}
-
-pub async fn recv_or_cancel<T>(
-    token: &CancellationToken,
-    receiver: &mut (impl Stream<Item = T> + Unpin),
-) -> Option<T> {
-    select! {
-        _ = token.cancelled() => None,
-        // propagate the None from an empty stream
-        result = receiver.next() => Some(result?),
     }
 }
 
@@ -107,10 +98,8 @@ pub async fn fetch_block(
     height: flume::Receiver<u64>,
     blocks: flume::Sender<(u64, Block)>,
 ) -> anyhow::Result<()> {
-    while let Some(new_height) = select! {
-        _ = token.cancelled() => None,
-        new_height = height.recv_async() => Some(new_height?),
-    } {
+    let mut heights = height.into_stream();
+    while let Some(new_height) = util::recv_or_cancel(&token, &mut heights).await {
         // our RPC call is blocking
         let block = task::block_in_place(|| get_block(&rpc, new_height))?;
         if new_height % 100 == 0 {
@@ -136,7 +125,7 @@ where
     // closure that creates new futures for each loop iteration
     let process = |block, height| processor.run(block, height);
     let mut block_stream = blocks_in.into_stream();
-    while let Some(block_with_height) = recv_or_cancel(&token, &mut block_stream).await {
+    while let Some(block_with_height) = util::recv_or_cancel(&token, &mut block_stream).await {
         let (height, block) = block_with_height;
         let (block_stats, new_block) = process(block, height).await?;
         stats_out.send_async(block_stats).await?;
@@ -197,11 +186,8 @@ pub async fn write_raw_block(
     job_out: flume::Sender<()>,
     dir: PathBuf,
 ) -> anyhow::Result<()> {
-    while let Some(block_with_height) = select! {
-        _ = token.cancelled() => None,
-        block_with_height = blocks_in.recv_async() => Some(block_with_height?),
-    } {
-        let (height, block) = block_with_height;
+    let mut blocks = blocks_in.into_stream();
+    while let Some((height, block)) = util::recv_or_cancel(&token, &mut blocks).await {
         let filename = format!("{}.blk", height);
         let filepath = dir.join(filename);
         tokio::fs::write(filepath, &block).await?;
@@ -219,11 +205,9 @@ pub async fn write_csv(
     stats_in: flume::Receiver<ZstdBlockStats>,
     job_out: flume::Sender<()>,
 ) -> anyhow::Result<()> {
-    while let Some(stats) = select! {
-        _ = token.cancelled() => None,
-        stats = stats_in.recv_async() => Some(stats?),
-    } {
-        statwriter.serialize(stats)?;
+    let mut stats = stats_in.into_stream();
+    while let Some(stat_line) = util::recv_or_cancel(&token, &mut stats).await {
+        statwriter.serialize(stat_line)?;
         job_out.send_async(()).await?;
     }
     Ok(())
@@ -254,14 +238,12 @@ pub async fn count_msgs(
     target: u64,
 ) -> anyhow::Result<u64> {
     let mut count = 0;
+    let mut msg_stream = msgs.into_stream();
     while count < target {
-        select! {
-            _ = token.cancelled() => break,
-            _ = msgs.recv_async() => {
-                count += 1;
-                if count % 100 == 0 {
-                    println!("{title}: received {count} messages");
-                }
+        if (util::recv_or_cancel(&token, &mut msg_stream).await).is_some() {
+            count += 1;
+            if count % 100 == 0 {
+                println!("{title}: received {count} messages");
             }
         }
     }

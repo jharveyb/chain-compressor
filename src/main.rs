@@ -1,12 +1,13 @@
-use std::fs::{self, File};
+use std::fs::{self};
 use std::path::PathBuf;
 
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use chain_compressor::*;
 use clap::{Args, Parser, Subcommand};
-use csv::WriterBuilder;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+mod util;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -127,10 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(block_range) => start_height..(start_height + block_range),
                 None => start_height..chain_tip_height,
             };
-            let target_job_count = match count {
-                Some(block_range) => block_range,
-                None => chain_tip_height - start_height,
-            };
+            let target_job_count = count.unwrap_or(chain_tip_height - start_height);
 
             // set jobs to detect pipeline completion
             let count_chans = vec![
@@ -177,28 +175,8 @@ async fn main() -> anyhow::Result<()> {
 
             // create our CSV reader for exporting stats
             let zstd_stats_filename = "zstd_cmp_stats.csv";
-            let zstdstatwriter = if let Some(statdir) = statdir.as_ref() {
-                if !fs::exists(statdir)? {
-                    fs::create_dir_all(statdir)?;
-                }
-
-                // create stats file before appending; we shouldn't end up
-                // truncating existing contents
-                let zstdstatfile = statdir.join(zstd_stats_filename);
-                let existing_file = fs::exists(&zstdstatfile)?;
-                if !existing_file {
-                    let _ = File::create(&zstdstatfile)?;
-                }
-
-                let stats_file = File::options().append(true).open(&zstdstatfile)?;
-                let writer = match existing_file {
-                    // don't write CSV headers again if we're appending
-                    true => WriterBuilder::new()
-                        .has_headers(false)
-                        .from_writer(stats_file),
-                    false => WriterBuilder::new().from_writer(stats_file),
-                };
-                Some(writer)
+            let statwriter = if let Some(dir) = statdir {
+                Some(util::init_csv_writer(zstd_stats_filename, &dir)?)
             } else {
                 None
             };
@@ -214,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if let Some(statwriter) = zstdstatwriter {
+            if let Some(statwriter) = statwriter {
                 let _ = write_stats_set.spawn(write_csv(
                     cancel_signal.child_token(),
                     statwriter,
@@ -232,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
 
             // wait on the pipeline stages to finish, beginning and end
             height_send_set.join_all().await;
+            process_block_zstd_set.join_all().await;
             completion_set.join_all().await;
 
             // job finished, shut down pipeline
