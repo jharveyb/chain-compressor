@@ -32,12 +32,12 @@ pub fn init_csv_writer(filename: &str, statdir: &PathBuf) -> anyhow::Result<csv:
     }
 
     let stats_file = File::options().append(true).open(&stats_path)?;
-    let writer = match existing_file {
-        // don't write CSV headers again if we're appending
-        true => WriterBuilder::new()
-            .has_headers(false)
-            .from_writer(stats_file),
-        false => WriterBuilder::new().from_writer(stats_file),
-    };
-    Ok(writer)
+    let mut writer = WriterBuilder::new();
+
+    // don't write CSV headers again if we're appending
+    if existing_file {
+        writer.has_headers(true);
+    }
+
+    Ok(writer.from_writer(stats_file))
 }

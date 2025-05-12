@@ -1,6 +1,6 @@
-use futures::Stream;
-use futures::StreamExt;
-use std::fs;
+use anyhow::anyhow;
+use bitcoin::consensus::Decodable;
+use std::fs::File;
 use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -60,6 +60,12 @@ pub struct ZstdBlockStats {
     savings: f32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TxPerBlockStats {
+    height: u64,
+    num_txs: u64,
+}
+
 // lookup block by height, return decoded block and its consensus size
 pub fn get_block(rpc: &Client, height: u64) -> anyhow::Result<Block> {
     let blockhash = rpc.get_block_hash(height)?;
@@ -90,6 +96,17 @@ pub async fn zstd_block(block: Block, height: u64) -> anyhow::Result<(ZstdBlockS
         savings,
     };
     Ok((stats_line, block_buf))
+}
+
+pub async fn count_block_txs(
+    block: Block,
+    height: u64,
+) -> anyhow::Result<(TxPerBlockStats, Vec<u8>)> {
+    let stats_line = TxPerBlockStats {
+        height,
+        num_txs: block.txdata.len() as u64,
+    };
+    Ok((stats_line, vec![]))
 }
 
 pub async fn fetch_block(
@@ -199,12 +216,45 @@ pub async fn write_raw_block(
     Ok(())
 }
 
-pub async fn write_csv(
+pub async fn read_block(
     token: CancellationToken,
-    mut statwriter: csv::Writer<fs::File>,
-    stats_in: flume::Receiver<ZstdBlockStats>,
-    job_out: flume::Sender<()>,
+    paths_in: flume::Receiver<PathBuf>,
+    blocks_out: flume::Sender<(u64, Block)>,
 ) -> anyhow::Result<()> {
+    let mut paths = paths_in.into_stream();
+    while let Some(blockpath) = util::recv_or_cancel(&token, &mut paths).await {
+        let raw_block = tokio::fs::read(&blockpath).await?;
+        let height = blockpath
+            .file_stem()
+            .and_then(|s| s.to_str().and_then(|n| n.parse::<u64>().ok()));
+        let height = height.ok_or_else(|| anyhow!("Invalid block filename"))?;
+        let block =
+            task::spawn_blocking(move || Block::consensus_decode(&mut raw_block.as_slice()))
+                .await??;
+        blocks_out.send_async((height, block)).await?;
+    }
+    Ok(())
+}
+
+pub async fn drop_block(
+    token: CancellationToken,
+    blocks_in: flume::Receiver<(u64, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    let mut blocks = blocks_in.into_stream();
+    // wait and no-op
+    while let Some((_, _)) = util::recv_or_cancel(&token, &mut blocks).await {}
+    Ok(())
+}
+
+pub async fn write_csv<S>(
+    token: CancellationToken,
+    mut statwriter: csv::Writer<File>,
+    stats_in: flume::Receiver<S>,
+    job_out: flume::Sender<()>,
+) -> anyhow::Result<()>
+where
+    S: Send + Sync + 'static + Serialize,
+{
     let mut stats = stats_in.into_stream();
     while let Some(stat_line) = util::recv_or_cancel(&token, &mut stats).await {
         statwriter.serialize(stat_line)?;
@@ -231,6 +281,26 @@ pub async fn send_heights(
     Ok(())
 }
 
+pub async fn send_paths(
+    token: CancellationToken,
+    paths: impl Iterator<Item = PathBuf>,
+    paths_tx: flume::Sender<PathBuf>,
+    job_count: flume::Sender<()>,
+) -> anyhow::Result<()> {
+    for (i, path) in paths.enumerate() {
+        select! {
+            _ = token.cancelled() => break,
+            _ = paths_tx.send_async(path) => {
+                job_count.send_async(()).await?;
+                if i % 100 == 0 {
+                    println!("sent path #{}00", i);
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
 pub async fn count_msgs(
     token: CancellationToken,
     msgs: flume::Receiver<()>,
@@ -248,6 +318,34 @@ pub async fn count_msgs(
         }
     }
     Ok(count)
+}
+
+pub async fn check_matching_job_count(
+    token: CancellationToken,
+    close: flume::Receiver<()>,
+    start: flume::Receiver<()>,
+    finish: flume::Receiver<()>,
+) -> anyhow::Result<()> {
+    let (mut start_count, mut finish_count) = (0, 0);
+    let mut closed = false;
+    loop {
+        select! {
+            _ = token.cancelled() => break,
+            _ = start.recv_async() => start_count += 1,
+            _ = finish.recv_async() => {
+                finish_count += 1;
+                if closed && start_count == finish_count {
+                    break;
+                }
+            },
+            closer = close.recv_async() => {
+                if closer.is_err() {
+                    closed = true;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn pipeline_checks(
