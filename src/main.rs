@@ -48,7 +48,17 @@ enum Commands {
         #[command(flatten)]
         rpc_conn: RpcConn,
     },
-    CollectStats {
+    CollectTxCountStats {
+        #[command(flatten)]
+        perf_args: PerfParams,
+
+        #[arg(long)]
+        blocksdir: Option<PathBuf>,
+
+        #[arg(long)]
+        statdir: Option<PathBuf>,
+    },
+    CollectOutputScriptTypeStats {
         #[command(flatten)]
         perf_args: PerfParams,
 
@@ -109,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
 
             Ok(())
         }
-        Commands::CollectStats {
+        Commands::CollectTxCountStats {
             perf_args,
             blocksdir,
             statdir,
@@ -152,10 +162,105 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Process blocks
-            process_block_workers(
+            let _process_block_set = process_block_workers(
                 &cancel_signal,
                 blocks_rx,
                 count_block_txs,
+                stats_tx,
+                raw_blocks_tx,
+                compute_thread_num,
+            );
+
+            // Drain raw_blocks chan
+            tokio::spawn(drop_block(
+                cancel_signal.child_token(),
+                raw_blocks_rx.clone(),
+            ));
+
+            write_stats_set.spawn(write_csv(
+                cancel_signal.child_token(),
+                statwriter,
+                stats_rx.clone(),
+                stat_job_tx.clone(),
+            ));
+
+            // Send filepaths into pipeline
+            paths_send_set.spawn(send_paths(
+                cancel_signal.child_token(),
+                block_files,
+                block_path_tx.clone(),
+                path_count_tx.clone(),
+            ));
+
+            let (paths_sent_tx, paths_sent_rx) = flume::bounded(1000);
+
+            // Monitor progress on both sides of pipeline
+            pipe_close_set.spawn(check_matching_job_count(
+                cancel_signal.child_token(),
+                paths_sent_rx,
+                path_count_rx,
+                stat_job_rx,
+            ));
+
+            // Send a signal once all paths have been sent
+            paths_send_set.join_all().await;
+            println!("Sent all paths");
+
+            drop(paths_sent_tx);
+            println!("Sent close trigger");
+
+            pipe_close_set.join_all().await;
+            cancel_signal.cancel();
+
+            Ok(())
+        }
+        Commands::CollectOutputScriptTypeStats {
+            perf_args,
+            blocksdir,
+            statdir,
+        } => {
+            // Require a blockdir and statdir
+            let block_files = glob::glob(
+                blocksdir
+                    .ok_or_else(|| anyhow!("Must specify a blockdir"))?
+                    .join("*.blk")
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid blockdir pattern"))?,
+            )?
+            .filter_map(|p| p.ok());
+
+            let stats_file = "block_output_type_counts.csv";
+            let statdir = statdir.ok_or_else(|| anyhow!("Must specify a statdir"))?;
+            let statwriter = util::init_csv_writer(stats_file, &statdir)?;
+
+            let io_thread_num = perf_args.io_threads.unwrap_or(1);
+            let compute_thread_num = perf_args.compute_threads.unwrap_or(1);
+
+            // task channels
+            let (block_path_tx, block_path_rx) = flume::bounded(1000);
+            let (path_count_tx, path_count_rx) = flume::bounded(1000);
+            let (stats_tx, stats_rx) = flume::bounded(1000);
+
+            // task pools
+            let mut read_blocks_set = JoinSet::new();
+            let mut paths_send_set = JoinSet::new();
+            let mut write_stats_set = JoinSet::new();
+            let mut pipe_close_set = JoinSet::new();
+
+            // Get blocks
+            for _ in 0..io_thread_num {
+                read_blocks_set.spawn(read_block(
+                    cancel_signal.child_token(),
+                    block_path_rx.clone(),
+                    blocks_tx.clone(),
+                ));
+            }
+
+            // Process blocks
+            let _process_block_set = process_block_workers(
+                &cancel_signal,
+                blocks_rx,
+                count_tx_types,
                 stats_tx,
                 raw_blocks_tx,
                 compute_thread_num,

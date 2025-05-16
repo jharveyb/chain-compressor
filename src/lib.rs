@@ -1,5 +1,8 @@
 use anyhow::anyhow;
+use bitcoin::Script;
 use bitcoin::consensus::Decodable;
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
 use std::fs::File;
 use std::future::Future;
 use std::ops::Range;
@@ -51,6 +54,20 @@ where
 // blocks are average size 900 kB; 727791885830 bytes / 884760 blocks
 pub const AVG_BLOCK_SIZE: usize = 900_000;
 
+#[derive(Debug, Copy, Clone, FromPrimitive)]
+enum ScriptType {
+    P2PK,
+    P2PKH,
+    Multisig,
+    OpReturn,
+    PushOnly,
+    P2SH,
+    P2WPKH,
+    P2WSH,
+    P2TR,
+    Other,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ZstdBlockStats {
     height: u64,
@@ -64,6 +81,21 @@ pub struct ZstdBlockStats {
 pub struct TxPerBlockStats {
     height: u64,
     num_txs: u64,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct OutputTypeStats {
+    height: u64,
+    p2pk: u32,
+    p2pkh: u32,
+    multisig: u32,
+    op_return: u32,
+    push_only: u32,
+    p2sh: u32,
+    p2wpkh: u32,
+    p2wsh: u32,
+    p2tr: u32,
+    other: u32,
 }
 
 // lookup block by height, return decoded block and its consensus size
@@ -107,6 +139,60 @@ pub async fn count_block_txs(
         num_txs: block.txdata.len() as u64,
     };
     Ok((stats_line, vec![]))
+}
+
+pub async fn count_tx_types(
+    block: Block,
+    height: u64,
+) -> anyhow::Result<(OutputTypeStats, Vec<u8>)> {
+    let txdata = &block.txdata;
+    let mut stats_line = OutputTypeStats {
+        height,
+        ..Default::default()
+    };
+    for tx in txdata {
+        for output in &tx.output {
+            let script = &output.script_pubkey;
+            match classify_output_type(script) {
+                ScriptType::P2PK => stats_line.p2pk += 1,
+                ScriptType::P2PKH => stats_line.p2pkh += 1,
+                ScriptType::Multisig => stats_line.multisig += 1,
+                ScriptType::OpReturn => stats_line.op_return += 1,
+                ScriptType::PushOnly => stats_line.push_only += 1,
+                ScriptType::P2SH => stats_line.p2sh += 1,
+                ScriptType::P2WPKH => stats_line.p2wpkh += 1,
+                ScriptType::P2WSH => stats_line.p2wsh += 1,
+                ScriptType::P2TR => stats_line.p2tr += 1,
+                ScriptType::Other => stats_line.other += 1,
+            }
+        }
+    }
+    Ok((stats_line, vec![]))
+}
+
+fn classify_output_type(script: &Script) -> ScriptType {
+    let classify_vec = vec![
+        script.is_p2pk(),
+        script.is_p2pkh(),
+        script.is_multisig(),
+        script.is_op_return(),
+        script.is_push_only(),
+        script.is_p2sh(),
+        script.is_p2wpkh(),
+        script.is_p2wsh(),
+        script.is_p2tr(),
+        true,
+    ];
+
+    for (idx, flag) in classify_vec.into_iter().enumerate() {
+        if flag {
+            // safe unwrap
+            return ScriptType::from_usize(idx).unwrap();
+        }
+    }
+
+    // should never be reached
+    ScriptType::Other
 }
 
 pub async fn fetch_block(
